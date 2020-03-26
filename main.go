@@ -10,10 +10,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
 var pd = flag.String("pd", "http://127.0.0.1:2379", "pd address")
+var minBytes = flag.Uint64("min-bytes", 500000, "min bytes")
 
 type Peer struct {
 	Id        uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -40,24 +42,64 @@ type StoreInfo struct {
 	} `json:"store"`
 }
 
+// StoreHotPeersInfos is used to get human-readable description for hot regions.
+type StoreHotPeersInfos struct {
+	AsPeer   StoreHotPeersStat `json:"as_peer"`
+	AsLeader StoreHotPeersStat `json:"as_leader"`
+}
+
+// StoreHotPeersStat is used to record the hot region statistics group by store.
+type StoreHotPeersStat map[uint64]*HotPeersStat
+
+type HotPeersStat struct {
+	TotalBytesRate float64       `json:"total_flow_bytes"`
+	Count          int           `json:"regions_count"`
+	Stats          []HotPeerStat `json:"statistics"`
+}
+
+// HotPeerStat records each hot peer's statistics
+type HotPeerStat struct {
+	StoreID  uint64 `json:"store_id"`
+	RegionID uint64 `json:"region_id"`
+
+	// HotDegree records the hot region update times
+	HotDegree int `json:"hot_degree"`
+	// AntiCount used to eliminate some noise when remove region in cache
+	AntiCount int `json:"anti_count"`
+
+	Kind     int     `json:"kind"`
+	ByteRate float64 `json:"flow_bytes"`
+	KeyRate  float64 `json:"flow_keys"`
+
+	// LastUpdateTime used to calculate average write
+	LastUpdateTime time.Time `json:"last_update_time"`
+	// Version used to check the region split times
+	Version uint64 `json:"version"`
+
+	needDelete bool
+	isLeader   bool
+	isNew      bool
+}
+
 type StoresInfo struct {
 	Stores []*StoreInfo `json:"stores"`
 }
 
 func main() {
-	res, err := http.Get(*pd + "/pd/api/v1/stores")
+	flag.Parse()
+	res, err := http.Get(*pd + "/pd/api/v1/hotspot/regions/write")
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	defer res.Body.Close()
-	var stores StoresInfo
+	var stores StoreHotPeersInfos
 	err = json.NewDecoder(res.Body).Decode(&stores)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-
+	fmt.Println("Step1: got hot regions")
 	res, err = http.Get(*pd + "/pd/api/v1/regions")
 	if err != nil {
 		fmt.Println(err)
@@ -70,12 +112,13 @@ func main() {
 		fmt.Println(err)
 		return
 	}
-	print(stores.Stores, regions.Regions)
+	fmt.Println("Step2: got regions")
+	print(stores.AsPeer, regions.Regions)
 }
 
-func print(stores []*StoreInfo, regions []*RegionInfo) {
+func print(stores StoreHotPeersStat, regions []*RegionInfo) {
 	sort.Slice(regions, func(i, j int) bool { return regions[i].StartKey < regions[j].StartKey })
-	maxKeyLen := 6
+	maxKeyLen := 10
 	for _, r := range regions {
 		r.StartKey, r.EndKey = convertKey(r.StartKey), convertKey(r.EndKey)
 		if l := fieldLen(r.StartKey); l > maxKeyLen {
@@ -91,30 +134,54 @@ func print(stores []*StoreInfo, regions []*RegionInfo) {
 			maxRegionIDLen = l
 		}
 	}
-	sort.Slice(stores, func(i, j int) bool { return stores[i].Store.ID < stores[j].Store.ID })
+	var storeIDs []uint64
+	for id := range stores {
+		storeIDs = append(storeIDs, id)
+	}
+
+	sort.Slice(storeIDs, func(i, j int) bool { return storeIDs[i] < storeIDs[j] })
 	var storeLen []int
-	for _, s := range stores {
-		storeLen = append(storeLen, fieldLen(s.Store.ID))
+	for id := range stores {
+		storeLen = append(storeLen, fieldLen(id))
 	}
 
 	field(maxRegionIDLen, "", "")
-	for i := range stores {
-		field(storeLen[i], "S"+strconv.FormatUint(stores[i].Store.ID, 10), "")
+	for i := range storeIDs {
+		field(storeLen[i], "S"+strconv.FormatUint(storeIDs[i], 10), "")
 	}
-	field(maxKeyLen, "start", "")
-	field(maxKeyLen, "end", "")
+	field(15, "bytes", "")
+	field(15, "rate", "")
 	fmt.Println()
+	isHot := func(region *RegionInfo) (bool, float64, float64) {
+		res := false
+		for _, peer := range region.Peers {
+			hotPeers, ok := stores[peer.StoreId]
+			if !ok {
+				continue
+			}
+			for _, hotPeer := range hotPeers.Stats {
+				if hotPeer.HotDegree >= 3 && hotPeer.RegionID == region.ID && uint64(hotPeer.ByteRate) > *minBytes {
+					return true, hotPeer.ByteRate, hotPeer.KeyRate
+				}
+			}
+		}
+		return res, 0, 0
+	}
 
 	for _, region := range regions {
+		hot, w, r := isHot(region)
+		if !hot {
+			continue
+		}
 		field(maxRegionIDLen, "R"+strconv.FormatUint(region.ID, 10), "")
 	STORE:
-		for i, s := range stores {
-			if region.Leader != nil && s.Store.ID == region.Leader.StoreId {
+		for i, sid := range storeIDs {
+			if region.Leader != nil && sid == region.Leader.StoreId {
 				field(storeLen[i], "▀", "\u001b[31m")
 				continue
 			}
 			for _, p := range region.Peers {
-				if p.StoreId == s.Store.ID {
+				if p.StoreId == sid {
 					if p.IsLearner {
 						field(storeLen[i], "▀", "\u001b[33m")
 					} else {
@@ -125,8 +192,8 @@ func print(stores []*StoreInfo, regions []*RegionInfo) {
 			}
 			field(storeLen[i], "", "")
 		}
-		field(maxKeyLen, region.StartKey, "")
-		field(maxKeyLen, region.EndKey, "")
+		field(15, strconv.FormatUint(uint64(w), 10), "")
+		field(15, strconv.FormatUint(uint64(r), 10), "")
 		fmt.Println()
 	}
 }
